@@ -5,38 +5,37 @@ import (
 	"flag"
 	"fmt"
 	"github.com/daiLlew/csvFilterTest/model"
+	"github.com/daiLlew/csvFilterTest/s3service"
 	"io"
-	"log"
 	"os"
 	"time"
 )
 
-const OUT_PATH = "results.txt"
+const (
+	OUT_PATH  = "results.txt"
+	STATS_FMT = "Stats:\n\tFile size: %f (MB)\n\tTime: %f seconds\n\tRows processed: %d\n\tDimensions Types: %d\n"
+)
 
 func main() {
-	in := flag.String("in", "", "The V3 csv file to parse")
+	bucket := flag.String("bucket", "", "AWS bucket to get the file from.")
+	filePath := flag.String("file", "", "AWS file to get.")
 	flag.Parse()
 
-	if len(*in) == 0 {
-		log.Fatal("Please specify an input file.")
-	} else {
-		fmt.Printf("Parsing %s\n", *in)
-	}
+	awsResponse := s3service.GetFileReader(*bucket, *filePath)
+	defer awsResponse.Close()
 
-	seconds, rowsProcessed, distinctDimensions := findDistinctDimensions(*in)
-	writeOutput(rowsProcessed, seconds, distinctDimensions)
+	stats, distinctDimensions := findDistinctDimensions(awsResponse)
+	fmt.Println(stats)
+	writeOutput(stats, distinctDimensions)
 }
 
-func findDistinctDimensions(inputFile string) (seconds float64, rowsProcessed int, distinctDimensions map[string]map[string]struct{}) {
-	f, _ := os.Open(inputFile)
-	defer f.Close()
-
+func findDistinctDimensions(awsResponse *s3service.AWSResponse) (stats string, distinctDimensions map[string]map[string]struct{}) {
 	start := time.Now().UnixNano()
-	reader := csv.NewReader(f)
-	header, _ := reader.Read()
+	csvReader := csv.NewReader(awsResponse.Reader)
+	header, _ := csvReader.Read()
 	dimensionIndices := getDimensionIndices(header)
 	distinctDimensions = make(map[string]map[string]struct{}, 0)
-	rowsProcessed = 0
+	rowsProcessed := 1
 
 	var row []string
 	var err error
@@ -48,7 +47,7 @@ func findDistinctDimensions(inputFile string) (seconds float64, rowsProcessed in
 
 	fmt.Println("Looking for unique Dimensions...")
 	for {
-		if row, err = reader.Read(); err == io.EOF {
+		if row, err = csvReader.Read(); err == io.EOF {
 			fmt.Println("File parse complete.")
 			break
 		}
@@ -70,13 +69,18 @@ func findDistinctDimensions(inputFile string) (seconds float64, rowsProcessed in
 		}
 		rowsProcessed++
 	}
-
-	timeElapsed := time.Now().UnixNano() - start
-	seconds = float64(timeElapsed) / float64(1000000000)
-	return seconds, rowsProcessed, distinctDimensions
+	return calculateStats(start, rowsProcessed, len(distinctDimensions), awsResponse.ByteCount), distinctDimensions
 }
 
-func writeOutput(rowsProcessed int, seconds float64, results map[string]map[string]struct{}) {
+func calculateStats(start int64, rowsProcessed int, distinctCount int, fileSize int64) string {
+	timeElapsed := time.Now().UnixNano() - start
+	seconds := float64(timeElapsed) / float64(1000000000)
+	sizeInMB := float64(fileSize) / 1000000.0
+
+	return fmt.Sprintf(STATS_FMT, sizeInMB, seconds, rowsProcessed, distinctCount)
+}
+
+func writeOutput(stats string, results map[string]map[string]struct{}) {
 	var f *os.File
 	var err error
 	defer f.Close()
@@ -100,11 +104,9 @@ func writeOutput(rowsProcessed int, seconds float64, results map[string]map[stri
 		panic(err)
 	}
 
-	f.WriteString(fmt.Sprintf("Total rows processed: %d, Time taken: %f seconds\n", rowsProcessed, seconds))
-	f.WriteString(fmt.Sprintf("Distinct Dimensions found: %d\n\n", len(results)))
-
+	f.WriteString(stats)
 	for key, value := range results {
-		f.WriteString(fmt.Sprintf("Dimension=%s * %d\n", key, len(value)))
+		f.WriteString(fmt.Sprintf("Dimension=%s, %d entries\n", key, len(value)))
 		for k, _ := range value {
 			f.WriteString(k)
 		}
